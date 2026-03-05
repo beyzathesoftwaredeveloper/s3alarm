@@ -1,0 +1,252 @@
+---
+- name: "Beyzanur StorageGRID S3 Utilization Alarm"
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    # StorageGRID S3 endpoint (S3 compatible endpoint)
+    s3_endpoint_url: "https://netapps3.turktelekom.intra:8082"
+    s3_region: "us-east-1"   # StorageGRID için çoğu ortamda mantıklı default; sizde farklıysa değiştir
+
+    # Alarm hedefi
+    target_bucket: "my-bucket"
+    threshold_percent: 80
+
+    # % hesaplamak için gereken "total/quota" (bytes)
+    # Örn: 500 GiB
+    bucket_quota_bytes: 536870912000
+
+    # Cooldown / state
+    cooldown_minutes: 30
+    alarm_state_dir: ".alarm_state"
+    alarm_state_file: "{{ alarm_state_dir }}/{{ target_bucket }}.json"
+
+    # SMTP (env’den de alabilirsin; burada vars olarak env lookup yapıyorum)
+    smtp_host: "{{ lookup('ansible.builtin.env', 'SMTP_HOST') }}"
+    smtp_port: "{{ lookup('ansible.builtin.env', 'SMTP_PORT') | default('587', true) }}"
+    smtp_user: "{{ lookup('ansible.builtin.env', 'SMTP_USERNAME') | default('', true) }}"
+    smtp_pass: "{{ lookup('ansible.builtin.env', 'SMTP_PASSWORD') | default('', true) }}"
+    smtp_use_tls: "{{ (lookup('ansible.builtin.env', 'SMTP_USE_TLS') | default('true', true)) | lower }}"
+    mail_from: "{{ lookup('ansible.builtin.env', 'MAIL_FROM') }}"
+    mail_to: "{{ lookup('ansible.builtin.env', 'MAIL_TO') }}"
+
+  tasks:
+    - name: Ensure state directory exists
+      ansible.builtin.file:
+        path: "{{ alarm_state_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Get current epoch time
+      ansible.builtin.command: date +%s
+      register: now_epoch
+      changed_when: false
+
+    - name: Read last alarm state if exists
+      ansible.builtin.stat:
+        path: "{{ alarm_state_file }}"
+      register: st_file
+
+    - name: Load last alarm state JSON
+      ansible.builtin.slurp:
+        path: "{{ alarm_state_file }}"
+      register: st_slurp
+      when: st_file.stat.exists
+
+    - name: Set last_sent_ts fact
+      ansible.builtin.set_fact:
+        last_sent_ts: >-
+          {{
+            (st_slurp.content | b64decode | from_json).last_sent_ts
+              if (st_file.stat.exists | default(false))
+              else none
+          }}
+
+    # 1) StorageGRID usage çek (SigV4 imzalı GET /?x-ntap-sg-usage)
+    # StorageGRID dokümanı: GET /?x-ntap-sg-usage bucket DataBytes döndürür. :contentReference[oaicite:1]{index=1}
+    - name: "GET: StorageGRID usage (x-ntap-sg-usage) and extract DataBytes for target bucket"
+      ansible.builtin.shell: |
+        set -euo pipefail
+        python3 - <<'PY'
+        import os, sys, json
+        import requests
+        import xml.etree.ElementTree as ET
+
+        from botocore.awsrequest import AWSRequest
+        from botocore.auth import SigV4Auth
+        from botocore.credentials import Credentials
+
+        endpoint = {{ s3_endpoint_url | to_json }}
+        region = {{ s3_region | to_json }}
+        access_key = os.environ["AWS_ACCESS_KEY_ID"]
+        secret_key = os.environ["AWS_SECRET_ACCESS_KEY"]
+        session_token = os.environ.get("AWS_SESSION_TOKEN")
+
+        target_bucket = {{ target_bucket | to_json }}
+
+        url = endpoint.rstrip("/") + "/?x-ntap-sg-usage"
+
+        # SigV4 sign
+        creds = Credentials(access_key, secret_key, session_token)
+        req = AWSRequest(method="GET", url=url, data=b"", headers={"host": requests.utils.urlparse(url).netloc})
+        SigV4Auth(creds, "s3", region).add_auth(req)
+
+        headers = dict(req.headers.items())
+        # StorageGRID internal CA / self-signed ise doğrulama kapatılabilir
+        verify = False
+
+        r = requests.get(url, headers=headers, timeout=30, verify=verify)
+        r.raise_for_status()
+
+        # Response XML parse
+        root = ET.fromstring(r.text)
+
+        # StorageGRID usage response: Buckets/Bucket + Name + DataBytes gibi alanlar bulunur. :contentReference[oaicite:2]{index=2}
+        # Namespace olabileceği için tag sonunu kullanacağız.
+        def tag_endswith(elem, name: str) -> bool:
+            return elem.tag.endswith("}" + name) or elem.tag == name
+
+        used_bytes = None
+        total_bytes_account = None
+
+        # account total
+        for e in root.iter():
+            if tag_endswith(e, "DataBytes") and e.text and e.text.strip().isdigit():
+                # Bu alan bucket altında da var, account altında da var; bucket'ı bulunca overwrite etmemek için
+                pass
+
+        # bucketları dolaş
+        for b in root.iter():
+            if tag_endswith(b, "Bucket"):
+                b_name = None
+                b_data = None
+                for c in list(b):
+                    if tag_endswith(c, "Name"):
+                        b_name = (c.text or "").strip()
+                    if tag_endswith(c, "DataBytes"):
+                        t = (c.text or "").strip()
+                        if t.isdigit():
+                            b_data = int(t)
+                if b_name == target_bucket:
+                    used_bytes = b_data
+                    break
+
+        if used_bytes is None:
+            # debug için ilk 500 char
+            raise RuntimeError(f"Bucket not found in usage response: {target_bucket}. XML head: {r.text[:500]}")
+
+        print(json.dumps({"bucket": target_bucket, "used_bytes": used_bytes}))
+        PY
+      args:
+        executable: /bin/bash
+      environment:
+        AWS_ACCESS_KEY_ID: "{{ lookup('ansible.builtin.env', 'AWS_ACCESS_KEY_ID') }}"
+        AWS_SECRET_ACCESS_KEY: "{{ lookup('ansible.builtin.env', 'AWS_SECRET_ACCESS_KEY') }}"
+        AWS_SESSION_TOKEN: "{{ lookup('ansible.builtin.env', 'AWS_SESSION_TOKEN') | default('', true) }}"
+      register: usage_out
+      changed_when: false
+
+    - name: Parse usage JSON
+      ansible.builtin.set_fact:
+        usage_json: "{{ usage_out.stdout | from_json }}"
+        used_bytes: "{{ (usage_out.stdout | from_json).used_bytes | float }}"
+        total_bytes: "{{ bucket_quota_bytes | float }}"
+
+    - name: Compute utilization percent
+      ansible.builtin.set_fact:
+        used_percent: "{{ (used_bytes / total_bytes) * 100.0 }}"
+
+    - name: Decide if cooldown passed
+      ansible.builtin.set_fact:
+        cooldown_ok: >-
+          {{
+            (last_sent_ts is none) or
+            (((now_epoch.stdout | int) - (last_sent_ts | int)) >= (cooldown_minutes * 60))
+          }}
+
+    - name: Debug summary
+      ansible.builtin.debug:
+        msg: >-
+          bucket={{ target_bucket }} used_bytes={{ used_bytes }} quota_bytes={{ total_bytes }}
+          used_percent={{ '%.2f'|format(used_percent) }} threshold={{ threshold_percent }}
+          cooldown_ok={{ cooldown_ok }}
+
+    # 2) Alarm koşulu: threshold aşıldı + cooldown geçtiyse mail at
+    - name: Send alarm email via SMTP (inline python)
+      ansible.builtin.shell: |
+        set -euo pipefail
+        python3 - <<'PY'
+        import os, smtplib
+        from email.mime.text import MIMEText
+        from email.mime.multipart import MIMEMultipart
+
+        bucket = {{ target_bucket | to_json }}
+        used_percent = float({{ used_percent | to_json }})
+        threshold = float({{ threshold_percent | to_json }})
+        used_bytes = float({{ used_bytes | to_json }})
+        total_bytes = float({{ total_bytes | to_json }})
+
+        smtp_host = os.environ["SMTP_HOST"]
+        smtp_port = int(os.environ.get("SMTP_PORT", "587"))
+        smtp_user = os.environ.get("SMTP_USERNAME", "")
+        smtp_pass = os.environ.get("SMTP_PASSWORD", "")
+        mail_from = os.environ["MAIL_FROM"]
+        mail_to = os.environ["MAIL_TO"]
+        use_tls = os.environ.get("SMTP_USE_TLS", "true").lower() == "true"
+
+        subject = f"ALARM: StorageGRID bucket {bucket} {used_percent:.2f}%"
+        body = (
+            "🚨 StorageGRID S3 Bucket Alarm\n\n"
+            f"Bucket: {bucket}\n"
+            f"Utilization: {used_percent:.2f}%\n"
+            f"Threshold: {threshold:.2f}%\n"
+            f"Used bytes: {used_bytes:.0f}\n"
+            f"Quota bytes: {total_bytes:.0f}\n"
+        )
+
+        msg = MIMEMultipart()
+        msg["From"] = mail_from
+        msg["To"] = mail_to
+        msg["Subject"] = subject
+        msg.attach(MIMEText(body, "plain", "utf-8"))
+
+        with smtplib.SMTP(smtp_host, smtp_port, timeout=30) as s:
+          if use_tls:
+            s.starttls()
+          if smtp_user:
+            s.login(smtp_user, smtp_pass)
+          s.sendmail(mail_from, [mail_to], msg.as_string())
+
+        print("Alarm email sent.")
+        PY
+      args:
+        executable: /bin/bash
+      environment:
+        SMTP_HOST: "{{ smtp_host }}"
+        SMTP_PORT: "{{ smtp_port }}"
+        SMTP_USERNAME: "{{ smtp_user }}"
+        SMTP_PASSWORD: "{{ smtp_pass }}"
+        SMTP_USE_TLS: "{{ smtp_use_tls }}"
+        MAIL_FROM: "{{ mail_from }}"
+        MAIL_TO: "{{ mail_to }}"
+      when:
+        - used_percent | float >= threshold_percent | float
+        - cooldown_ok | bool
+
+    - name: Update alarm state file (when alarm sent)
+      ansible.builtin.copy:
+        dest: "{{ alarm_state_file }}"
+        content: |
+          {
+            "last_sent_ts": {{ now_epoch.stdout | int }},
+            "last_used_percent": {{ used_percent | float }}
+          }
+        mode: "0644"
+      when:
+        - used_percent | float >= threshold_percent | float
+        - cooldown_ok | bool
+
+    - name: OK message
+      ansible.builtin.debug:
+        msg: "OK: utilization {{ '%.2f'|format(used_percent) }}% < threshold {{ threshold_percent }}%"
+      when: used_percent | float < threshold_percent | float
