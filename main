@@ -1,0 +1,43 @@
+---
+- name: "Beyzanur Automation"
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    bucket_name: "my-bucket-name"
+    bucket_limit_bytes: 100000000000   # 100 GB örnek limit
+
+  tasks:
+
+    - name: "GET: S3 Info"
+      amazon.aws.s3_bucket_info:
+        name: "{{ bucket_name }}"
+        access_key: "{{ lookup('ansible.builtin.env', 'AWS_ACCESS_KEY_ID') }}"
+        secret_key: "{{ lookup('ansible.builtin.env', 'AWS_SECRET_ACCESS_KEY') }}"
+        endpoint_url: "https://netapps3.turktelekom.intra:8082"
+        validate_certs: false
+      register: result
+
+    - name: "Calculate used bytes"
+      set_fact:
+        used_bytes: "{{ result.buckets[0].size | default(0) }}"
+
+    - name: "Run S3 Alarm Python"
+      ansible.builtin.command: python3 s3_alarm.py
+      args:
+        stdin: |
+          {
+            "bucket_name": "{{ bucket_name }}",
+            "used_bytes": "{{ used_bytes }}",
+            "total_bytes": "{{ bucket_limit_bytes }}"
+          }
+      environment:
+        SMTP_HOST: "{{ lookup('env','SMTP_HOST') }}"
+        SMTP_PORT: "{{ lookup('env','SMTP_PORT') }}"
+        SMTP_USERNAME: "{{ lookup('env','SMTP_USERNAME') }}"
+        SMTP_PASSWORD: "{{ lookup('env','SMTP_PASSWORD') }}"
+        MAIL_FROM: "{{ lookup('env','MAIL_FROM') }}"
+        MAIL_TO: "{{ lookup('env','MAIL_TO') }}"
+        S3_THRESHOLD_PERCENT: "80"
+        ALARM_COOLDOWN_MINUTES: "30"
+        ALARM_STATE_PATH: ".alarm_state/state.json"
