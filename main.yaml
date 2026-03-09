@@ -9,6 +9,12 @@
 
   tasks:
 
+    - name: Download alarm.py from GitHub
+      ansible.builtin.get_url:
+        url: "https://raw.githubusercontent.com/beyzathesoftwaredeveloper/s3alarm/main/alarm.py"
+        dest: "./alarm.py"
+        mode: '0755'
+
     - name: "GET: S3 Info"
       amazon.aws.s3_bucket_info:
         name: "{{ bucket_name }}"
@@ -23,7 +29,7 @@
         used_bytes: "{{ result.buckets[0].size | default(0) }}"
 
     - name: "Run S3 Alarm Python"
-      ansible.builtin.command: python3 s3_alarm.py
+      ansible.builtin.command: python3 alarm.py
       args:
         stdin: |
           {
