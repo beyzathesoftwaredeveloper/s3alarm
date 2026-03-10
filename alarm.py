@@ -8,12 +8,14 @@ from typing import Dict, Any, Optional
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
+import boto3
+
 
 def env(name: str, default: Optional[str] = None, required: bool = True) -> str:
-    v = os.getenv(name, default)
-    if required and (v is None or str(v).strip() == ""):
+    value = os.getenv(name, default)
+    if required and (value is None or str(value).strip() == ""):
         raise RuntimeError(f"Missing env var: {name}")
-    return str(v)
+    return str(value)
 
 
 def state_key(bucket: str) -> str:
@@ -24,15 +26,17 @@ def load_state(path: str) -> Dict[str, Any]:
     if not os.path.exists(path):
         return {}
     try:
-        with open(path, "r") as f:
+        with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return {}
 
 
 def save_state(path: str, state: Dict[str, Any]) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w") as f:
+    dir_name = os.path.dirname(path)
+    if dir_name:
+        os.makedirs(dir_name, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2)
 
 
@@ -42,7 +46,7 @@ def should_notify(last_sent: Optional[float], cooldown: int) -> bool:
     return (time.time() - last_sent) >= cooldown * 60
 
 
-def send_mail(subject: str, body: str):
+def send_mail(subject: str, body: str) -> None:
     smtp_host = env("SMTP_HOST")
     smtp_port = int(env("SMTP_PORT", "587", required=False))
     smtp_user = env("SMTP_USERNAME", "", required=False)
@@ -51,31 +55,70 @@ def send_mail(subject: str, body: str):
     mail_to = env("MAIL_TO")
     use_tls = env("SMTP_USE_TLS", "true", required=False).lower() == "true"
 
+    recipients = [x.strip() for x in mail_to.split(",") if x.strip()]
+    if not recipients:
+        raise RuntimeError("MAIL_TO is empty")
+
     msg = MIMEMultipart()
     msg["From"] = mail_from
-    msg["To"] = mail_to
+    msg["To"] = ", ".join(recipients)
     msg["Subject"] = subject
-    msg.attach(MIMEText(body, "plain"))
+    msg.attach(MIMEText(body, "plain", "utf-8"))
 
-    with smtplib.SMTP(smtp_host, smtp_port) as server:
+    with smtplib.SMTP(smtp_host, smtp_port, timeout=30) as server:
         if use_tls:
             server.starttls()
         if smtp_user:
             server.login(smtp_user, smtp_pass)
-        server.sendmail(mail_from, [mail_to], msg.as_string())
+        server.sendmail(mail_from, recipients, msg.as_string())
 
 
-def main():
+def get_bucket_usage() -> Dict[str, Any]:
+    bucket_name = env("S3_BUCKET_NAME")
+    endpoint_url = env("S3_ENDPOINT_URL")
+    access_key = env("S3_ACCESS_KEY")
+    secret_key = env("S3_SECRET_KEY")
+    region = env("AWS_REGION", "us-east-1", required=False)
+    total_bytes = float(env("S3_BUCKET_QUOTA_BYTES"))
+
+    s3 = boto3.client(
+        "s3",
+        endpoint_url=endpoint_url,
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key,
+        region_name=region,
+    )
+
+    paginator = s3.get_paginator("list_objects_v2")
+    pages = paginator.paginate(Bucket=bucket_name)
+
+    used_bytes = 0.0
+    object_count = 0
+
+    for page in pages:
+        for obj in page.get("Contents", []):
+            used_bytes += float(obj.get("Size", 0))
+            object_count += 1
+
+    return {
+        "bucket_name": bucket_name,
+        "used_bytes": used_bytes,
+        "total_bytes": total_bytes,
+        "object_count": object_count,
+    }
+
+
+def main() -> int:
     threshold = float(env("S3_THRESHOLD_PERCENT", "80", required=False))
     cooldown = int(env("ALARM_COOLDOWN_MINUTES", "30", required=False))
     state_path = env("ALARM_STATE_PATH", ".alarm_state/state.json", required=False)
 
-    # Ansible JSON input
-    data = json.load(sys.stdin)
+    usage = get_bucket_usage()
 
-    bucket_name = data.get("bucket_name")
-    used_bytes = float(data.get("used_bytes", 0))
-    total_bytes = float(data.get("total_bytes", 0))
+    bucket_name = usage["bucket_name"]
+    used_bytes = usage["used_bytes"]
+    total_bytes = usage["total_bytes"]
+    object_count = usage["object_count"]
 
     if total_bytes <= 0:
         print("Total capacity is zero, skipping.")
@@ -87,7 +130,18 @@ def main():
     key = state_key(bucket_name)
     last_sent = st.get(key, {}).get("last_sent_ts")
 
-    print(f"Bucket={bucket_name} Used={percent:.2f}% Threshold={threshold}%")
+    print(
+        json.dumps(
+            {
+                "bucket_name": bucket_name,
+                "used_bytes": used_bytes,
+                "total_bytes": total_bytes,
+                "object_count": object_count,
+                "percent": round(percent, 2),
+                "threshold": threshold,
+            }
+        )
+    )
 
     if percent >= threshold:
         if should_notify(last_sent, cooldown):
@@ -99,6 +153,7 @@ def main():
                 f"Threshold: {threshold}%\n"
                 f"Used bytes: {used_bytes}\n"
                 f"Total bytes: {total_bytes}\n"
+                f"Object count: {object_count}\n"
             )
             send_mail(subject, body)
             st[key] = {"last_sent_ts": time.time()}
@@ -115,6 +170,6 @@ def main():
 if __name__ == "__main__":
     try:
         sys.exit(main())
-    except Exception as e:
-        print(f"Error: {e}", file=sys.stderr)
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)
